@@ -2,7 +2,7 @@
 #![no_main]
 
 use esp_backtrace as _;
-use esp_hal::{self as eh};
+use esp_hal::{self as eh, system::{CpuControl, Stack}, time::Duration};
 use eh::{
     clock::CpuClock,
     delay::Delay,
@@ -12,7 +12,7 @@ use eh::{
 };
 
 
-use core::fmt::Write;
+use core::{fmt::Write, ptr::addr_of_mut, sync::atomic::{AtomicU32, Ordering}};
 esp_bootloader_esp_idf::esp_app_desc!();
 
 
@@ -29,6 +29,9 @@ use embedded_graphics::{
 };
 use ssd1306::{I2CDisplayInterface, Ssd1306, mode::DisplayConfig, size::DisplaySize128x64};
 
+static mut APP_CORE_STACK: Stack<8192> = Stack::new();
+
+static HITUNG_CORE1: AtomicU32 = AtomicU32::new(0);
 #[main]
 fn main() -> ! {
     
@@ -47,10 +50,6 @@ fn main() -> ! {
     // Token Kepemilikan Mutlak: Bertindak sebagai "kunci akses eksklusif" yang memastikan setiap modul hardware hanya dipegang dan dikontrol oleh satu bagian program saja.
     // Pencegah Konflik (Safety): Menerapkan aturan kepemilikan (ownership) ala Rust untuk mencegah bug berbahaya seperti race condition atau konfigurasi hardware ganda.
     let peripherals: eh::peripherals::Peripherals = esp_hal::init(config);
-
-    
-    // Kita akan mengaloksikan heap sebesar ±98 KB
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
 
     
     // Setup Layar OLED
@@ -139,34 +138,107 @@ fn main() -> ! {
     // 5. Buffer Overflow: Menulis data melebihi kapasitas ukuran buffer yang disediakan, 
     //    bisa menimpa data di alamat memori sebelahnya dan bikin program nge-hang atau 
     //    bahkan celah keamanan.
+    
+    // Kita akan mengaloksikan heap sebesar ±98 KB
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
 
     // Maka dari itu disarankan untuk 
     // 1. Hindari membuat program reporting / agregasi yang berlebihan sampai sampai memakan memory besar
     // 2. Membuat dan menggunakana deref manual (Gunakan best practice Box)
     // 3. membuat fungsi rekursi
-
-    let mut pin_menyala: Box<u8> = Box::new(0);
     let delay = Delay::new();
 
     let text_style = MonoTextStyleBuilder::new().font(&FONT_6X10).text_color(BinaryColor::On).build();
 
-    // 3. Atur sesuka lo di sini
+    // Management Core CPU
+    // Berbeda dengan di komputer dengan OS dimana cpu, thread dll, sudah diatur oleh OS, lagi lagi di embedded kita betul betul di bebaskan untuk melakukan management nya manual sendiri
+    // Kita bisa menggunakan struct CpuControl untuk melakukan kontrol pada CPU
+    // Dengan cara menggunakan function dari esp_hal::CpuControl::new(peripherals.CPU_CTRL)
+    
+    let mut cpu_control = CpuControl::new(peripherals.CPU_CTRL);
+    // Konsep dasar
+    // ESP32 punya 2 core: Core 0 (PRO_CPU) dan Core 1 (APP_CPU)
+    // Core 0 otomatis nyala dan menjalankan fungsi main kita
+    // Core 1 mati sampai kita nyalain manual dengan CpuControl::start_app_core(stack, closure)
+    // Kalau WiFi/BLE tidak dipakai, kedua core bebas kita pakai sepenuhnya
+    // Cpu::current() bisa dipakai untuk mengecek kode sedang jalan di core mana
+
+    // Stack milik core 1
+    // Core 1 tidak bisa berbagi stack dengan core 0, jadi kita wajib menyediakan stack sendiri
+    // Caranya dengan membuat static Stack<N>, contoh: static mut APP_CORE_STACK: Stack<8192> = Stack::new();
+    // Stack ini masuk ke .bss (RAM statis), jadi ikut mengurangi sisa RAM yang tersedia
+    // Mulai dari 8 KB, naikkan ke 16 KB kalau closure memakai log, format string, atau array besar
+    // Stack overflow di core 1 sama diam-diamnya dengan core 0, jadi crash tanpa pesan jelas
+
+    // Closure dan ownership
+    // Program untuk core 1 dikirim lewat closure yang diberi keyword move
+    // Pin atau peripheral yang dipakai di dalam closure dipindahkan (moved) ke core 1
+    // Artinya pin itu tidak bisa lagi dipakai di core 0, ownership Rust mencegah dua core rebutan hardware yang sama
+    // Closure harus berisi loop {} karena core 1 tidak punya OS yang menutup programnya
+
+    // Guard (jangan sampai ke-drop)
+    // start_app_core mengembalikan sebuah guard
+    // Kalau guard ini di-drop (misalnya ditulis let _ = ...), core 1 langsung dimatikan
+    // Makanya harus ditampung ke variabel bernama, contoh: let _guard = ...
+
+    let _guard = cpu_control
+    .start_app_core(unsafe {&mut *addr_of_mut!(APP_CORE_STACK)}, move || {
+        let delay = Delay::new();
+        loop {
+            delay.delay(Duration::from_millis(800));
+            if HITUNG_CORE1.load(Ordering::Relaxed) == 4 {
+                HITUNG_CORE1.store(0, Ordering::Relaxed);
+            } else {
+                HITUNG_CORE1.fetch_add(1, Ordering::Relaxed);
+            }
+            
+        }
+    } ).unwrap();
+
+
+    // Berbagi data antar core
+    // Memori (RAM dan heap) dilihat oleh kedua core, tapi akses bersamaan harus aman
+    // 1. AtomicXxx (AtomicU32, AtomicBool, dll): untuk angka atau flag sederhana, tanpa lock
+    //    Ordering::Relaxed cukup kalau hanya butuh nilainya, bukan urutan antar variabel
+    // 2. critical_section::Mutex<RefCell<T>>: untuk struct atau data yang lebih kompleks
+    // 3. Queue/channel (misal heapless::spsc::Queue): untuk kirim data satu arah antar core
+    // Jangan pakai static mut untuk data yang dibagi, itu sumber data race
+
+    // Catatan penting
+    // 1. delay_millis itu blocking, core yang memanggilnya berhenti total selama waktu itu
+    //    Dengan 2 core, tiap core bisa punya timing sendiri tanpa saling menunggu
+    // 2. Heap (esp_alloc) aman dipakai dua core, tapi alokasi berulang di dua core bikin saling antre
+    // 3. Peripheral dipakai satu core saja, kalau butuh dipakai bersama, bungkus dengan Mutex
+    // 4. Di debug build, panic di core 1 tidak otomatis menghentikan core 0
+    // 5. Kalau butuh banyak task dengan penjadwalan otomatis (preemptive, mirip FreeRTOS),
+    //    pakai esp-rtos atau Embassy, itu level di atas CpuControl yang bare-metal
+
+  
+    // Ini akan berjalan di core 0 (default)
     loop {
-        // for pin in &mut pins {
-        //     *pin_menyala += 1;
-        //     pin.set_high();
-        //       let mut buff: heapless::String<17> = heapless::String::new();
-        //     let _ = write!(buff, "Pin menyala: {}", pin_menyala);
+            let now_count = HITUNG_CORE1.load(Ordering::Relaxed) as usize;
+            if !pins[now_count].is_set_high() {
+                pins[now_count].set_high();
+            }
+            let mut buff: heapless::String<17> = heapless::String::new();
+            let _ = write!(buff, "Pin menyala: {}", now_count+1);
 
-        //     layar.clear_buffer();
+            layar.clear_buffer();
 
-        //     Text::new(&buff, Point::new(0, 12), text_style).draw(&mut layar).unwrap();
+            Text::new(&buff, Point::new(0, 12), text_style).draw(&mut layar).unwrap();
 
-        //     layar.flush().unwrap();
+            layar.flush().unwrap();
 
 
-        //     delay.delay_millis(200);
-        //     pin.set_low();
-        // }
+            if now_count != 0 {
+                if pins[now_count-1].is_set_high(){
+                pins[now_count-1].set_low();
+                }
+            } else {
+                 if !pins[4].is_set_low() {
+                    pins[4].set_low()
+                 }
+            }
+            
     }
 }

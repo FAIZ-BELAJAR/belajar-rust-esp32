@@ -3,6 +3,7 @@ edition      = "2024"
 name         = "sistem-kamar"
 rust-version = "1.88"
 version      = "0.1.0"
+default-run  = "code"
 
 [[bin]]
 name = "code"

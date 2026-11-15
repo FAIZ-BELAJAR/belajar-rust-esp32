@@ -2,7 +2,7 @@
 #![no_main]
 
 use esp_backtrace as _;
-use esp_hal::{self as eh, system::{CpuControl, Stack}, time::Duration};
+use esp_hal::{self as eh, gpio::Flex, system::{CpuControl, Stack}, time::Duration};
 use eh::{
     clock::CpuClock,
     delay::Delay,
@@ -12,7 +12,7 @@ use eh::{
 };
 
 
-use core::{fmt::Write, ptr::addr_of_mut, sync::atomic::{AtomicU32, Ordering}};
+use core::{fmt::Write, ptr::addr_of_mut, sync::atomic::{AtomicU8, AtomicU32, Ordering}};
 esp_bootloader_esp_idf::esp_app_desc!();
 
 
@@ -29,9 +29,13 @@ use embedded_graphics::{
 };
 use ssd1306::{I2CDisplayInterface, Ssd1306, mode::DisplayConfig, size::DisplaySize128x64};
 
+mod dht11_gue;
+
 static mut APP_CORE_STACK: Stack<8192> = Stack::new();
 
 static HITUNG_CORE1: AtomicU32 = AtomicU32::new(0);
+static SUHU: AtomicU8 = AtomicU8::new(0);
+static HUMIDITAS: AtomicU8 = AtomicU8::new(0);
 #[main]
 fn main() -> ! {
     
@@ -115,6 +119,12 @@ fn main() -> ! {
     // GPIO10 → D3 flash
     // GPIO11 → CMD flash
 
+    // Jenis pin di esp hal terbagi menjadi 3, yakni
+    // Input : pin khusus baca (menerima tegangan)
+    // Output: pin khusus tulis, push-pull (mengubah ubah tegangan)
+    // Flex: gabungan dari keduanya baca&tulis (membaca dan mengubah ubah tegangan)
+    // Pada dasarnya pin itu berstatus hanya Low(tak ada tegangan) High (ada tegangan)
+
     let mut pins: [Output; 5] = [
         Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default()), 
         Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default()), 
@@ -176,27 +186,7 @@ fn main() -> ! {
     // Artinya pin itu tidak bisa lagi dipakai di core 0, ownership Rust mencegah dua core rebutan hardware yang sama
     // Closure harus berisi loop {} karena core 1 tidak punya OS yang menutup programnya
 
-    // Guard (jangan sampai ke-drop)
-    // start_app_core mengembalikan sebuah guard
-    // Kalau guard ini di-drop (misalnya ditulis let _ = ...), core 1 langsung dimatikan
-    // Makanya harus ditampung ke variabel bernama, contoh: let _guard = ...
-
-    let _guard = cpu_control
-    .start_app_core(unsafe {&mut *addr_of_mut!(APP_CORE_STACK)}, move || {
-        let delay = Delay::new();
-        loop {
-            delay.delay(Duration::from_millis(800));
-            if HITUNG_CORE1.load(Ordering::Relaxed) == 4 {
-                HITUNG_CORE1.store(0, Ordering::Relaxed);
-            } else {
-                HITUNG_CORE1.fetch_add(1, Ordering::Relaxed);
-            }
-            
-        }
-    } ).unwrap();
-
-
-    // Berbagi data antar core
+      // Berbagi data antar core
     // Memori (RAM dan heap) dilihat oleh kedua core, tapi akses bersamaan harus aman
     // 1. AtomicXxx (AtomicU32, AtomicBool, dll): untuk angka atau flag sederhana, tanpa lock
     //    Ordering::Relaxed cukup kalau hanya butuh nilainya, bukan urutan antar variabel
@@ -213,32 +203,74 @@ fn main() -> ! {
     // 5. Kalau butuh banyak task dengan penjadwalan otomatis (preemptive, mirip FreeRTOS),
     //    pakai esp-rtos atau Embassy, itu level di atas CpuControl yang bare-metal
 
-  
-    // Ini akan berjalan di core 0 (default)
-    loop {
-            let now_count = HITUNG_CORE1.load(Ordering::Relaxed) as usize;
-            if !pins[now_count].is_set_high() {
-                pins[now_count].set_high();
-            }
-            let mut buff: heapless::String<17> = heapless::String::new();
-            let _ = write!(buff, "Pin menyala: {}", now_count+1);
 
-            layar.clear_buffer();
+    // Guard (jangan sampai ke-drop)
+    // start_app_core mengembalikan sebuah guard
+    // Kalau guard ini di-drop (misalnya ditulis let _ = ...), core 1 langsung dimatikan
+    // Makanya harus ditampung ke variabel bernama, contoh: let _guard = ...
 
-            Text::new(&buff, Point::new(0, 12), text_style).draw(&mut layar).unwrap();
+    // Ini akan berjalan di core 1
+    let _guard = cpu_control
+    .start_app_core(unsafe {&mut *addr_of_mut!(APP_CORE_STACK)}, move || {
+        let delay = Delay::new();
+        let mut pin_sensor = Flex::new(peripherals.GPIO25);
+        let mut binding = Delay::new();
+        let mut sensor = dht11_gue::sensor_dht11(&mut pin_sensor, &mut binding);
+        
+        delay.delay(Duration::from_millis(5000));
 
-            layar.flush().unwrap();
-
-
-            if now_count != 0 {
-                if pins[now_count-1].is_set_high(){
-                pins[now_count-1].set_low();
-                }
+        loop {
+            delay.delay(Duration::from_millis(800));
+            dht11_gue::dapatkan_data(&mut sensor, &SUHU, &HUMIDITAS);
+            if HITUNG_CORE1.load(Ordering::Relaxed) == 4 {
+                HITUNG_CORE1.store(0, Ordering::Relaxed);
             } else {
-                 if !pins[4].is_set_low() {
-                    pins[4].set_low()
-                 }
+                HITUNG_CORE1.fetch_add(1, Ordering::Relaxed);
             }
             
+        }
+    } ).unwrap();
+
+
+    // Ini akan berjalan di core 0 (default)
+   // Ini akan berjalan di core 0 (default)
+    loop {
+        let now_count = HITUNG_CORE1.load(Ordering::Relaxed) as usize;
+        if !pins[now_count].is_set_high() {
+            pins[now_count].set_high();
+        }
+
+        // Ambil data suhu dan humiditas dari atomic variable (di-update oleh Core 1)
+        let suhu_val = SUHU.load(Ordering::Relaxed);
+        let humid_val = HUMIDITAS.load(Ordering::Relaxed);
+
+        // Buat string untuk ditampilkan ke layar OLED
+        let mut buff_pin: heapless::String<17> = heapless::String::new();
+        let _ = write!(buff_pin, "Pin: {}", now_count + 1);
+
+        let mut buff_suhu: heapless::String<17> = heapless::String::new();
+        let _ = write!(buff_suhu, "Suhu: {} C", suhu_val);
+
+        let mut buff_humid: heapless::String<17> = heapless::String::new();
+        let _ = write!(buff_humid, "Humid: {}%", humid_val);
+
+        layar.clear_buffer();
+
+        // Render teks ke layar dengan koordinat Y berbeda agar tidak bertumpuk
+        Text::new(&buff_pin, Point::new(0, 12), text_style).draw(&mut layar).unwrap();
+        Text::new(&buff_suhu, Point::new(0, 28), text_style).draw(&mut layar).unwrap();
+        Text::new(&buff_humid, Point::new(0, 44), text_style).draw(&mut layar).unwrap();
+
+        layar.flush().unwrap();
+
+        if now_count != 0 {
+            if pins[now_count - 1].is_set_high() {
+                pins[now_count - 1].set_low();
+            }
+        } else {
+            if !pins[4].is_set_low() {
+                pins[4].set_low();
+            }
+        }
     }
 }

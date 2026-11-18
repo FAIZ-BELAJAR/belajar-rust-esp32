@@ -29,13 +29,53 @@ use embedded_graphics::{
 };
 use ssd1306::{I2CDisplayInterface, Ssd1306, mode::DisplayConfig, size::DisplaySize128x64};
 
+// Import untuk Interrupt (tambahan)
+// Butuh di Cargo.toml: critical-section = "1"
+use core::{cell::RefCell, sync::atomic::AtomicBool};
+use critical_section::Mutex;
+use esp_hal::{
+    gpio::{Event, Input, InputConfig, Io, Pull},
+    handler,
+    time::Instant,
+};
+
 mod dht11_gue;
 
 static mut APP_CORE_STACK: Stack<8192> = Stack::new();
 
 static HITUNG_CORE1: AtomicU32 = AtomicU32::new(0);
-static SUHU: AtomicU8 = AtomicU8::new(0);
-static HUMIDITAS: AtomicU8 = AtomicU8::new(0);
+
+// Data yang dibagi antara ISR dan main (bagian Management Interrupt)
+// Atomic dipakai untuk angka/flag sederhana, tanpa lock
+static TOMBOL_DITEKAN: AtomicBool = AtomicBool::new(false);
+static JUMLAH_TEKAN: AtomicU32 = AtomicU32::new(0);
+static TERAKHIR_MS: AtomicU32 = AtomicU32::new(0); // untuk debounce
+
+// Objek hardware yang dipakai ISR dibungkus Mutex<RefCell<Option<..>>>
+// Option karena static butuh nilai awal sebelum Input-nya ada (None dulu, diisi di main)
+static TOMBOL: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
+
+// ISR (Interrupt Service Routine): jalan otomatis tiap ada sinyal turun di GPIO27
+// Aturan: singkat, tanpa flush OLED, tanpa alokasi heap, tanpa delay, dan WAJIB clear interrupt
+#[handler]
+fn gpio_isr() {
+    critical_section::with(|cs| {
+        let mut slot = TOMBOL.borrow_ref_mut(cs);
+        if let Some(tombol) = slot.as_mut() {
+            if tombol.is_interrupt_set() {
+                // debounce sederhana: abaikan kalau < 50 ms dari tekanan sebelumnya
+                let sekarang = Instant::now().duration_since_epoch().as_millis() as u32;
+                if sekarang.wrapping_sub(TERAKHIR_MS.load(Ordering::Relaxed)) > 50 {
+                    TERAKHIR_MS.store(sekarang, Ordering::Relaxed);
+                    JUMLAH_TEKAN.fetch_add(1, Ordering::Relaxed);
+                    TOMBOL_DITEKAN.store(true, Ordering::Release);
+                }
+                tombol.clear_interrupt(); // WAJIB, kalau lupa ISR dipanggil terus dan chip terlihat hang
+            }
+        }
+    });
+}
+
 #[main]
 fn main() -> ! {
     
@@ -203,7 +243,6 @@ fn main() -> ! {
     // 5. Kalau butuh banyak task dengan penjadwalan otomatis (preemptive, mirip FreeRTOS),
     //    pakai esp-rtos atau Embassy, itu level di atas CpuControl yang bare-metal
 
-
     // Guard (jangan sampai ke-drop)
     // start_app_core mengembalikan sebuah guard
     // Kalau guard ini di-drop (misalnya ditulis let _ = ...), core 1 langsung dimatikan
@@ -214,14 +253,11 @@ fn main() -> ! {
     .start_app_core(unsafe {&mut *addr_of_mut!(APP_CORE_STACK)}, move || {
         let delay = Delay::new();
         let mut pin_sensor = Flex::new(peripherals.GPIO25);
-        let mut binding = Delay::new();
-        let mut sensor = dht11_gue::sensor_dht11(&mut pin_sensor, &mut binding);
-        
+
         delay.delay(Duration::from_millis(5000));
 
         loop {
-            delay.delay(Duration::from_millis(800));
-            dht11_gue::dapatkan_data(&mut sensor, &SUHU, &HUMIDITAS);
+            delay.delay(Duration::from_millis(2000));
             if HITUNG_CORE1.load(Ordering::Relaxed) == 4 {
                 HITUNG_CORE1.store(0, Ordering::Relaxed);
             } else {
@@ -232,6 +268,145 @@ fn main() -> ! {
     } ).unwrap();
 
 
+    // Management Interrupt
+    // Selama ini program kita memakai polling: loop terus berputar dan mengecek "ada kejadian belum?"
+    // Interrupt membalik cara itu: hardware yang "menyela" CPU saat kejadian terjadi (tombol ditekan, timer habis, data UART masuk)
+    // CPU berhenti sebentar dari kerjaan sekarang, lompat ke fungsi khusus (ISR / handler), lalu kembali persis ke tempat semula
+    // Keuntungannya respons cepat tanpa harus mengecek terus, dan CPU bebas mengerjakan hal lain di antaranya
+    // Kita tidak perlu menulis kode "kembali ke tempat semula", hardware dan esp-hal yang mengurus
+
+    // Tiga pemain yang harus dikoordinasikan sendiri di bare-metal
+    // 1. main (core 0): jalan terus-menerus (super-loop)
+    // 2. ISR: jalan tiba-tiba, bisa menyela main di baris kode mana pun
+    // 3. Closure core 1: jalan paralel di core lain
+    // Masalah utamanya ada di nomor 2, ISR bisa memotong main di tengah operasi, maka data yang dibagi tidak boleh diakses sembarangan
+
+    // Alur interrupt di esp-hal
+    // 1. Tulis fungsi handler dengan atribut #[handler] (lihat gpio_isr di atas main)
+    // 2. Daftarkan ke sistem: Io::new(peripherals.IO_MUX) lalu io.set_interrupt_handler(gpio_isr)
+    // 3. Aktifkan sumbernya: tombol.listen(Event::FallingEdge)
+    // 4. Di dalam handler, WAJIB bersihkan penanda interrupt: tombol.clear_interrupt()
+    // Tanpa langkah 4 interrupt dianggap masih aktif, handler dipanggil berulang dan chip terlihat hang
+
+    // Jenis event GPIO (kapan interrupt dipicu)
+    // Event::RisingEdge  : sinyal naik LOW -> HIGH
+    // Event::FallingEdge : sinyal turun HIGH -> LOW (cocok untuk tombol dengan pull-up, ditekan = LOW)
+    // Event::AnyEdge     : naik maupun turun, bisa dibedakan dengan membaca tombol.is_low() di handler
+    // Event::LowLevel    : selama sinyal LOW (hati-hati, terus memicu selama level bertahan)
+    // Event::HighLevel   : selama sinyal HIGH (sama, hati-hati)
+    // Edge (tepi) lebih aman dari level karena hanya memicu sekali per perubahan
+
+    // Aturan emas ISR
+    // 1. SINGKAT. Set flag atau tambah counter lalu keluar
+    // 2. Jangan flush OLED, jangan info!/println, jangan delay, jangan alokasi heap (Vec::push, Box::new, String)
+    // 3. Wajib clear interrupt
+    // 4. Kerjaan berat dilempar ke main lewat flag: ISR cuma bilang "ada kejadian", main yang mengerjakan
+    // Alasannya, selama ISR jalan, kerjaan main berhenti dan interrupt lain bisa tertahan
+
+    // Berbagi data ISR dan main
+    // 1. AtomicBool / AtomicU32: untuk flag dan counter sederhana (TOMBOL_DITEKAN, JUMLAH_TEKAN)
+    //    swap(false) membaca sekaligus mereset flag dalam satu operasi, jadi tidak ada celah ISR menyelip lalu flag hilang
+    // 2. critical_section::with: mematikan interrupt sementara (dan mengunci core lain) selama blok berjalan
+    //    Dipakai untuk objek yang diakses ISR dan main, seperti Input pada static TOMBOL
+    // 3. Mutex<RefCell<Option<T>>>: pola standar objek hardware yang dipakai ISR
+    //    Mutex untuk akses aman, RefCell untuk mengubah isi, Option karena awalnya kosong (None)
+    // 4. Queue (heapless::spsc::Queue): kalau yang dikirim ISR adalah data, bukan sekadar sinyal
+    // Pasangan Ordering Release (penulis) dan Acquire (pembaca) menjamin data yang ditulis sebelum flag terlihat setelah flag dibaca
+
+    // Interrupt dan core
+    // ISR jalan di core yang mendaftarkannya (core yang memanggil set_interrupt_handler dan listen)
+    // Pada kode ini pendaftaran dilakukan di main, jadi ISR jalan di core 0
+    // Kalau ingin ISR di core 1, lakukan pendaftaran dari dalam closure core 1
+    // Satu sumber interrupt dipakai satu handler, jadi jangan daftarkan hal yang sama dari dua core
+
+    // Prioritas interrupt
+    // Tiap interrupt punya level prioritas, interrupt berprioritas tinggi bisa menyela ISR berprioritas rendah
+    // Di esp-hal prioritas bisa diatur lewat atribut handler (contoh: #[handler(priority = Priority::Priority1)])
+    // dan tipe Priority dari esp_hal::interrupt, nama persisnya bisa bergeser antar versi, cek docs versi esp-hal yang dipakai
+    // Pegangan: kerjaan yang timing-nya kritis berprioritas lebih tinggi, tapi tetap harus super singkat
+
+    // Debounce
+    // Tombol mekanis "bergetar" beberapa milidetik saat ditekan, satu tekanan bisa memicu banyak interrupt
+    // Solusi sederhana (dipakai di gpio_isr): catat waktu tekanan terakhir, abaikan kalau selisihnya < 50 ms
+    // Wrapping: gunakan wrapping_sub agar tetap benar saat counter waktu u32 overflow
+
+    // Bug umum
+    // 1. Lupa clear_interrupt: handler dipanggil terus, program seperti hang
+    // 2. ISR terlalu berat (flush OLED, log): main tertahan, interrupt lain terlewat
+    // 3. Variabel biasa (non-atomic) dibagi ISR dan main: data race, nilai bisa rusak atau tidak terlihat
+    // 4. Lupa debounce: satu tekanan terhitung banyak kali
+    // 5. Memakai pin tombol yang sama dengan fungsi lain (GPIO27 di sini bebas, sedangkan strapping pin berisiko)
+    // 6. Menyimpan objek yang dipakai ISR di static mut: gunakan Mutex<RefCell<Option<T>>>
+
+    // Wiring contoh: tombol antara GPIO27 dan GND, pull-up internal aktif (Pull::Up), jadi ditekan = LOW
+    // Daftarkan handler lebih dulu, baru aktifkan listen, supaya tidak ada interrupt yang tiba saat handler belum siap
+        // Io::new(peripherals.IO_MUX)
+    // Mengambil token IO_MUX (blok hardware pengelola pin) dan membungkusnya jadi struct Io
+    // Io adalah tempat mendaftarkan handler interrupt GPIO, karena semua pin GPIO berbagi satu sumber interrupt
+    // mut dibutuhkan karena set_interrupt_handler mengubah isi Io
+
+    //     pub enum Event {
+    //     RisingEdge,
+    //     FallingEdge,
+    //     AnyEdge,
+    //     LowLevel,
+    //     HighLevel,
+    // }
+    // Varian	Artinya	Kapan memicu
+    // RisingEdge	Tepi naik	Sekali, saat sinyal berubah LOW → HIGH
+    // FallingEdge	Tepi turun	Sekali, saat sinyal berubah HIGH → LOW
+    // AnyEdge	Tepi mana saja	Sekali tiap perubahan, naik maupun turun
+    // LowLevel	Level rendah	Terus-menerus selama sinyal berada di LOW
+    // HighLevel	Level tinggi	Terus-menerus selama sinyal berada di HIGH
+    // Edge vs level
+    // Sinyal:  HIGH ─────┐         ┌───── HIGH
+    //                    │         │
+    //          LOW       └─────────┘
+    //                    ↑         ↑
+    //               FallingEdge  RisingEdge
+    //                    └─ LowLevel aktif di sepanjang bagian bawah ini ─┘
+    
+    let mut io = Io::new(peripherals.IO_MUX);
+
+    // io.set_interrupt_handler(gpio_isr)
+    // Mendaftarkan gpio_isr sebagai fungsi yang dipanggil otomatis tiap ada interrupt GPIO
+    // Ini baru pendaftaran, interrupt belum aktif sampai listen() dipanggil di bawah
+    // Memanggil ini dua kali akan MENGGANTI handler lama, jadi cukup sekali untuk semua pin GPIO
+    io.set_interrupt_handler(gpio_isr);
+
+    // Input::new(peripherals.GPIO27, ...)
+    // Mengubah GPIO27 menjadi pin input (pin khusus baca tegangan)
+    // peripherals.GPIO27 dipindahkan (moved) ke variabel tombol, jadi pin ini tidak bisa dipakai lagi di tempat lain
+    // mut dibutuhkan karena listen() dan clear_interrupt() mengubah state pin
+    let mut tombol = Input::new(
+        peripherals.GPIO27,
+        // InputConfig::default().with_pull(Pull::Up)
+        // Mengaktifkan resistor pull-up internal: saat tombol dilepas pin ditarik ke HIGH (3.3V)
+        // Saat tombol ditekan, pin tersambung ke GND jadi LOW
+        // Tanpa ini pin mengambang (floating) dan membaca nilai acak, jadi tombol tidak butuh resistor eksternal
+        InputConfig::default().with_pull(Pull::Up),
+    );
+
+    // critical_section::with(|cs| { ... })
+    // Menjalankan blok di dalamnya dengan interrupt dimatikan sementara (dan core lain dikunci)
+    // cs adalah bukti bahwa kita sedang di dalam critical section, dan dibutuhkan untuk mengakses Mutex (TOMBOL)
+    // Dipakai supaya listen dan replace terjadi sebagai satu kesatuan, ISR tidak bisa menyela di antaranya
+    critical_section::with(|cs| {
+        // tombol.listen(Event::FallingEdge)
+        // Mengaktifkan interrupt untuk pin ini, mulai saat ini sinyal turun (HIGH -> LOW) memicu gpio_isr
+        // FallingEdge = tepat saat tombol ditekan (karena pull-up), hanya sekali per tekanan
+        // Sengaja dipanggil di dalam critical section agar ISR baru bisa jalan setelah tombol sudah ada di static
+        tombol.listen(Event::FallingEdge);
+
+        // TOMBOL.borrow_ref_mut(cs).replace(tombol)
+        // borrow_ref_mut(cs): meminjam isi static TOMBOL (RefCell) secara mutable, butuh bukti cs
+        // replace(tombol): mengisi Option yang tadinya None dengan Some(tombol)
+        // Ownership Input dipindah ke static agar bisa diakses ISR (untuk clear_interrupt)
+        // Setelah baris ini variabel tombol di main sudah tidak bisa dipakai lagi
+        TOMBOL.borrow_ref_mut(cs).replace(tombol);
+    });
+
+
     // Ini akan berjalan di core 0 (default)
    // Ini akan berjalan di core 0 (default)
     loop {
@@ -240,26 +415,26 @@ fn main() -> ! {
             pins[now_count].set_high();
         }
 
-        // Ambil data suhu dan humiditas dari atomic variable (di-update oleh Core 1)
-        let suhu_val = SUHU.load(Ordering::Relaxed);
-        let humid_val = HUMIDITAS.load(Ordering::Relaxed);
-
         // Buat string untuk ditampilkan ke layar OLED
         let mut buff_pin: heapless::String<17> = heapless::String::new();
         let _ = write!(buff_pin, "Pin: {}", now_count + 1);
 
-        let mut buff_suhu: heapless::String<17> = heapless::String::new();
-        let _ = write!(buff_suhu, "Suhu: {} C", suhu_val);
+        // Hitung tekanan tombol dari ISR (tanda * muncul di frame setelah tombol baru ditekan)
+        let baru_ditekan = TOMBOL_DITEKAN.swap(false, Ordering::Acquire);
+        let mut buff_tekan: heapless::String<24> = heapless::String::new();
+        let _ = write!(
+            buff_tekan,
+            "Tekan: {}{}",
+            JUMLAH_TEKAN.load(Ordering::Relaxed),
+            if baru_ditekan { " *" } else { "" }
+        );
 
-        let mut buff_humid: heapless::String<17> = heapless::String::new();
-        let _ = write!(buff_humid, "Humid: {}%", humid_val);
 
         layar.clear_buffer();
 
         // Render teks ke layar dengan koordinat Y berbeda agar tidak bertumpuk
         Text::new(&buff_pin, Point::new(0, 12), text_style).draw(&mut layar).unwrap();
-        Text::new(&buff_suhu, Point::new(0, 28), text_style).draw(&mut layar).unwrap();
-        Text::new(&buff_humid, Point::new(0, 44), text_style).draw(&mut layar).unwrap();
+        Text::new(&buff_tekan, Point::new(0, 24), text_style).draw(&mut layar).unwrap();
 
         layar.flush().unwrap();
 

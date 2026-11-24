@@ -51,9 +51,13 @@ static TOMBOL_DITEKAN: AtomicBool = AtomicBool::new(false);
 static JUMLAH_TEKAN: AtomicU32 = AtomicU32::new(0);
 static TERAKHIR_MS: AtomicU32 = AtomicU32::new(0); // untuk debounce
 
+static JUMLAH_TEKAN2: AtomicU32 = AtomicU32::new(0);
+static TERAKHIR_MS2: AtomicU32 = AtomicU32::new(0);
+
 // Objek hardware yang dipakai ISR dibungkus Mutex<RefCell<Option<..>>>
 // Option karena static butuh nilai awal sebelum Input-nya ada (None dulu, diisi di main)
 static TOMBOL: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
+static TOMBOL2: Mutex<RefCell<Option<Input<'static>>>> = Mutex::new(RefCell::new(None));
 
 // ISR (Interrupt Service Routine): jalan otomatis tiap ada sinyal turun di GPIO27
 // Aturan: singkat, tanpa flush OLED, tanpa alokasi heap, tanpa delay, dan WAJIB clear interrupt
@@ -71,6 +75,18 @@ fn gpio_isr() {
                     TOMBOL_DITEKAN.store(true, Ordering::Release);
                 }
                 tombol.clear_interrupt(); // WAJIB, kalau lupa ISR dipanggil terus dan chip terlihat hang
+            }
+        }
+
+         let mut slot2 = TOMBOL2.borrow_ref_mut(cs);
+        if let Some(tombol2) = slot2.as_mut() {
+            if tombol2.is_interrupt_set() {
+                let sekarang = Instant::now().duration_since_epoch().as_millis() as u32;
+                if sekarang.wrapping_sub(TERAKHIR_MS2.load(Ordering::Relaxed)) > 50 {
+                    TERAKHIR_MS2.store(sekarang, Ordering::Relaxed);
+                    JUMLAH_TEKAN2.fetch_add(1, Ordering::Relaxed);
+                }
+                tombol2.clear_interrupt(); // WAJIB juga untuk tombol kedua
             }
         }
     });
@@ -95,6 +111,7 @@ fn main() -> ! {
     // Pencegah Konflik (Safety): Menerapkan aturan kepemilikan (ownership) ala Rust untuk mencegah bug berbahaya seperti race condition atau konfigurasi hardware ganda.
     let peripherals: eh::peripherals::Peripherals = esp_hal::init(config);
 
+
     
     // Setup Layar OLED
     // tidak menjadi topik inti kita, karna kita akan fokus memahami dulu ekosistem mikrokontroller esp32 dahulu
@@ -108,6 +125,7 @@ fn main() -> ! {
     let mut layar = Ssd1306::new(ui, DisplaySize128x64, ssd1306::rotation::DisplayRotation::Rotate0).into_buffered_graphics_mode();
 
     layar.init().unwrap();
+
 
     // Peripherals.GPIO
     // kita pasti tahu bahwa mikrokontroller memiliki pin pin yang tersebar di dalam nya
@@ -290,7 +308,7 @@ fn main() -> ! {
 
     // Jenis event GPIO (kapan interrupt dipicu)
     // Event::RisingEdge  : sinyal naik LOW -> HIGH
-    // Event::FallingEdge : sinyal turun HIGH -> LOW (cocok untuk tombol dengan pull-up, ditekan = LOW)
+    // Event::FallingEdge : sinyal turun HIGH -> LOW (cocok untuk tom`bol dengan pull-up, ditekan = LOW)
     // Event::AnyEdge     : naik maupun turun, bisa dibedakan dengan membaca tombol.is_low() di handler
     // Event::LowLevel    : selama sinyal LOW (hati-hati, terus memicu selama level bertahan)
     // Event::HighLevel   : selama sinyal HIGH (sama, hati-hati)
@@ -387,6 +405,7 @@ fn main() -> ! {
         InputConfig::default().with_pull(Pull::Up),
     );
 
+    let mut tombol2 = Input::new(peripherals.GPIO26, InputConfig::default().with_pull(Pull::Up));
     // critical_section::with(|cs| { ... })
     // Menjalankan blok di dalamnya dengan interrupt dimatikan sementara (dan core lain dikunci)
     // cs adalah bukti bahwa kita sedang di dalam critical section, dan dibutuhkan untuk mengakses Mutex (TOMBOL)
@@ -404,6 +423,15 @@ fn main() -> ! {
         // Ownership Input dipindah ke static agar bisa diakses ISR (untuk clear_interrupt)
         // Setelah baris ini variabel tombol di main sudah tidak bisa dipakai lagi
         TOMBOL.borrow_ref_mut(cs).replace(tombol);
+    });
+
+    let mut tegangan_32 = Output::new(peripherals.GPIO32, Level::Low, OutputConfig::default());
+
+    tegangan_32.set_high();
+
+    critical_section::with(|cs|{
+        tombol2.listen(Event::FallingEdge);
+        TOMBOL2.borrow_ref_mut(cs).replace(tombol2)
     });
 
 
@@ -429,12 +457,18 @@ fn main() -> ! {
             if baru_ditekan { " *" } else { "" }
         );
 
+        let mut buff_tekan2: heapless::String<24> = heapless::String::new();
+        let _ = write!(buff_tekan2, 
+            "Tekan2: {} {}", JUMLAH_TEKAN2.load(Ordering::Relaxed), 
+            if baru_ditekan { " *" } else { "" });
+    
 
         layar.clear_buffer();
 
         // Render teks ke layar dengan koordinat Y berbeda agar tidak bertumpuk
         Text::new(&buff_pin, Point::new(0, 12), text_style).draw(&mut layar).unwrap();
         Text::new(&buff_tekan, Point::new(0, 24), text_style).draw(&mut layar).unwrap();
+        Text::new(&buff_tekan2, Point::new(0, 36), text_style).draw(&mut layar).unwrap();
 
         layar.flush().unwrap();
 
